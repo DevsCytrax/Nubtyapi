@@ -8,7 +8,7 @@ from urllib.parse import urlparse, parse_qs
 from utils.innertube import resolve as innertube_resolve
 from utils.ytdlp_runner import resolve_g
 
-__all__ = ["get_stream", "get_video_stream", "invalidate"]
+__all__ = ["get_stream", "get_video_stream", "invalidate", "resolve_target_url"]
 
 logger = logging.getLogger("ytube_api.Stream")
 
@@ -17,6 +17,7 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 
 _MEM_CACHE = {}
 _REDIS_CLIENT = None  # Lazy initialized
+
 
 async def _get_redis():
     global _REDIS_CLIENT
@@ -81,10 +82,7 @@ def _read_cache(url: str, prefix: str = "") -> tuple[str | None, int]:
 
 
 def _write_cache(url: str, stream_url: str, prefix: str = ""):
-    expire = _extract_expire(stream_url)
-    if not expire:
-        logger.warning(f"[CACHE SKIP] No expire found in stream URL for {url[:80]}")
-        return
+    expire = _extract_expire(stream_url) or (int(time.time()) + 3600)
 
     try:
         with open(_cache_path(url, prefix), "w") as f:
@@ -139,6 +137,37 @@ async def _resolve(url: str, kind: str, format_selector: str, cookies: str | Non
     return await _run_yt_dlp(url, format_selector, cookies)
 
 
+async def resolve_target_url(url: str) -> tuple[str, bool]:
+    """Resolve input URL or search query to a target URL (or direct stream URL).
+
+    Returns (resolved_url, is_direct_stream).
+    """
+    try:
+        from utils.platform_resolvers import detect_provider, resolve_to_playable_stream
+        provider = detect_provider(url)
+        if provider in ("apple_music", "amazon_music", "jiosaavn", "soundcloud", "spotify"):
+            res = await resolve_to_playable_stream(url)
+            if res.get("stream_url") and provider == "jiosaavn":
+                return res["stream_url"], True
+            if provider == "soundcloud":
+                return url, False
+            if res.get("stream_url") and ("youtube.com" in res["stream_url"] or "youtu.be" in res["stream_url"]):
+                return res["stream_url"], False
+            search_query = res.get("search_query")
+            if search_query:
+                from utils.search_service import fetch_results
+                search_res = await fetch_results(search_query, limit=1)
+                results = search_res.get("main_results", [])
+                if results and results[0].get("url"):
+                    return results[0]["url"], False
+                elif results and results[0].get("video_id"):
+                    return f"https://www.youtube.com/watch?v={results[0]['video_id']}", False
+                return f"ytsearch:{search_query}", False
+    except Exception as e:
+        logger.warning(f"[PLATFORM RESOLVE ERROR] {url[:80]}: {e}")
+    return url, False
+
+
 async def get_stream(url: str, cookies: str | None = None) -> str | None:
     prefix = "audio:"
     
@@ -164,13 +193,18 @@ async def get_stream(url: str, cookies: str | None = None) -> str | None:
                 pass
         return cached_url
 
-    # 3. Resolve — Innertube first, yt-dlp fallback
-    stream_url = await _resolve(url, "audio", "251/250/bestaudio[ext=m4a]/bestaudio", cookies)
+    # 3. Resolve target
+    target_url, is_direct = await resolve_target_url(url)
+    if is_direct:
+        stream_url = target_url
+    else:
+        stream_url = await _resolve(target_url, "audio", "251/250/bestaudio[ext=m4a]/bestaudio", cookies)
+
     if stream_url:
         # 4. Write cache
         _write_cache(url, stream_url, prefix)
-        expire = _extract_expire(stream_url)
-        if expire and redis:
+        expire = _extract_expire(stream_url) or (int(time.time()) + 3600)
+        if redis:
             ttl = int(expire - time.time())
             if ttl > 0:
                 try:
@@ -204,13 +238,18 @@ async def get_video_stream(url: str, cookies: str | None = None) -> str | None:
                 pass
         return cached_url
 
-    # 3. Resolve — Innertube first, yt-dlp fallback
-    stream_url = await _resolve(url, "muxed", "22/18/best[ext=mp4]", cookies)
+    # 3. Resolve target
+    target_url, is_direct = await resolve_target_url(url)
+    if is_direct:
+        stream_url = target_url
+    else:
+        stream_url = await _resolve(target_url, "muxed", "22/18/best[ext=mp4]", cookies)
+
     if stream_url:
         # 4. Write cache
         _write_cache(url, stream_url, prefix)
-        expire = _extract_expire(stream_url)
-        if expire and redis:
+        expire = _extract_expire(stream_url) or (int(time.time()) + 3600)
+        if redis:
             ttl = int(expire - time.time())
             if ttl > 0:
                 try:
@@ -218,4 +257,3 @@ async def get_video_stream(url: str, cookies: str | None = None) -> str | None:
                 except Exception:
                     pass
     return stream_url
-

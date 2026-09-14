@@ -709,6 +709,14 @@ async def read_root():
     return {
         "name": "ytube_api API",
         "version": "2026.3.12",
+        "supported_platforms": [
+            "YouTube",
+            "Apple Music",
+            "Amazon Music",
+            "SoundCloud",
+            "JioSaavn",
+            "Spotify"
+        ],
         "endpoints": {
             "/search": "Search songs via scrape or YouTube Data API (FREE)",
             "/trending": "Get trending music (FREE)",
